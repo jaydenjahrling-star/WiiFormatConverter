@@ -1,0 +1,18 @@
+# PyInstaller build artifacts
+# Temporary and generated files created during .exe packaging
+build/
+dist/
+WiiFormatConverter.spec
+
+# Conversion output folders
+# Automatically created by the tool when saving converted files
+RVZ/
+WBFS/
+
+# Python cache files
+# Bytecode and cache folders generated automatically by Python
+__pycache__/
+*.pyc
+
+# Local user configuration
+config.ini
