@@ -171,17 +171,28 @@ TOOL_CANDIDATES = {
         r"C:\Program Files\NKit\nkit.exe",
     ],
 }
-# Smoke-test arguments and accepted exit codes per tool (nkit without parameters exits 2)
-TOOL_SMOKE = {"wit_tool": (("--version",), {0}), "nkit_tool": ((), {0, 2}), "dolphin_tool": (("--version",), {0})}
+# Start-up check arguments per tool (only used right after unpacking a download)
+TOOL_SMOKE = {"wit_tool": ("--version",), "nkit_tool": ("-cfg", "n"), "dolphin_tool": ("--version",)}
 
-def _tool_runs(exe: Path, args=("--version",), ok_codes=frozenset({0})) -> bool:
-    """Smoke test: the binary starts and exits as expected (catches missing DLLs, AV blocks)."""
+def _tool_starts(exe: Path, args=()):
+    """
+    Start-up check after unpacking a download: does the binary launch at all?
+    Returns (started, detail). Only a launch failure or a crash-style exit code
+    (NTSTATUS, e.g. missing DLL 0xC0000135, blocked by antivirus) counts as
+    "not started"; any ordinary exit code, including usage errors, is fine.
+    """
     try:
-        r = subprocess.run([str(exe), *args], capture_output=True, timeout=120,
-                           cwd=str(exe.parent))
-        return r.returncode in ok_codes
-    except Exception:
-        return False
+        r = subprocess.run([str(exe), *args], capture_output=True, timeout=45,
+                           cwd=str(exe.parent), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return True, "still running after 45 s (assumed started)"
+    except OSError as exc:
+        return False, str(exc)
+    code = r.returncode
+    if code < 0 or code > 0xFFFF:
+        out = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()
+        return False, f"exit code {code} (0x{code & 0xFFFFFFFF:08X}) {out[-300:]}".strip()
+    return True, f"exit code {code}"
 
 def _download(url: str, dest: Path, expected_sha256: str = ""):
     """Download url to dest with a progress line; verify sha256 when given."""
@@ -297,11 +308,14 @@ def install_tool(key: str) -> Path:
     if n == 0 or not exe.exists():
         raise RuntimeError(f"{exe_name} not found inside the downloaded archive")
     ok(f"Unpacked {n} file(s)")
-    smoke_args, ok_codes = TOOL_SMOKE[key]
-    if not _tool_runs(exe, smoke_args, ok_codes):
-        raise RuntimeError(f"{exe} was unpacked but does not start. "
-                           "If your antivirus quarantined it, restore/allow it and run again.")
-    ok(f"Ready: {exe}")
+    started, detail = _tool_starts(exe, TOOL_SMOKE[key])
+    if started:
+        ok(f"Ready: {exe}")
+    else:
+        # Do not block on this heuristic: the real run reports the actual error per file.
+        warn(f"{exe.name} did not start cleanly during the check: {detail}")
+        warn("Continuing anyway. If every conversion fails, check whether your antivirus "
+             f"quarantined {exe.name} and allow it.")
     return exe
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -522,12 +536,13 @@ def run_cmd(cmd: list, desc: str) -> bool:
     return True
 
 def run_cmd_code(cmd: list, desc: str) -> int:
-    """Like run_cmd but returns the exit code (-1 if it could not start)."""
+    """Like run_cmd but returns the exit code (-1 if it could not start). stdin is closed
+    so a tool that asks a question fails instead of waiting forever."""
     info(f"Command: {' '.join(str(c) for c in cmd)}")
     print()
     t0 = time.time()
     try:
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
     except OSError as exc:
         error(f"{desc} could not start: {exc}")
         return -1
