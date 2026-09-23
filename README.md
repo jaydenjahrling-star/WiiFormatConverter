@@ -12,6 +12,7 @@ It supports **drag & drop** and works with both the Python script and the precom
 - Convert **RVZ → WBFS**
 - Convert **ISO → RVZ**
 - Convert **ISO → WBFS**
+- **Batch mode**: convert a whole folder of ISOs to WBFS in one go (`iso_to_wbfs.bat`)
 - Drag & drop support on Windows
 - Native Windows prompt for choosing the target format when an **ISO** file is dropped
 - Separate output folders for **RVZ** and **WBFS**
@@ -26,6 +27,7 @@ It supports **drag & drop** and works with both the Python script and the precom
 WiiConverter/
 ├── convert.py              ← main Python script
 ├── convert.bat             ← drag & drop launcher (Windows)
+├── iso_to_wbfs.bat         ← batch launcher: D:\Wii\ISO → D:\Wii\wbfs
 ├── config.sample.ini       ← sample configuration file
 ├── version_info.txt        ← Windows version metadata for the .exe
 ├── WiiFormatExchanger.ico  ← application icon
@@ -109,6 +111,10 @@ output_wbfs = .\WBFS
 [conversion]
 rvz_compression = zstd
 rvz_compression_level = 5
+
+[batch]
+input_iso = D:\Wii\ISO
+output_wbfs = D:\Wii\wbfs
 ```
 
 ### Configuration keys
@@ -121,6 +127,12 @@ rvz_compression_level = 5
 | `output_wbfs` | Output folder for WBFS files | `.\WBFS` |
 | `rvz_compression` | RVZ compression codec: `none`, `zstd`, `bzip2`, `lzma`, `lzma2` | `zstd` |
 | `rvz_compression_level` | Compression level (`1-22` for `zstd`, `1-9` for others) | `5` |
+| `[batch] input_iso` | Folder scanned for `.iso` files in batch mode | `D:\Wii\ISO` |
+| `[batch] output_wbfs` | Folder where batch mode writes `.wbfs` files | `D:\Wii\wbfs` |
+
+`wit.exe` and `DolphinTool.exe` are also auto-detected next to the script, on the system `PATH`,
+and in the usual install folders (`C:\WiimmsISOTools\`, `C:\Program Files\Wiimm\WIT\`,
+`C:\Dolphin\`, `C:\Program Files\Dolphin\`) if the configured path does not exist.
 
 ### Example: absolute output folders
 
@@ -139,6 +151,33 @@ output_wbfs = .\WBFS
 ---
 
 ## Usage
+
+### Batch: convert every ISO in `D:\Wii\ISO` to WBFS in `D:\Wii\wbfs`
+
+1. Install [Wiimms ISO Tools](https://wit.wiimm.de/) (only `wit.exe` is needed for this).
+2. Copy `config.sample.ini` to `config.ini` (the tool creates one on first run if it is missing).
+3. Double-click **`iso_to_wbfs.bat`**.
+
+Every `.iso` in `D:\Wii\ISO` is written as `<same name>.wbfs` into `D:\Wii\wbfs`.
+Files that already exist in the output folder are skipped, so you can re-run it after adding
+new ISOs. Original ISOs are never deleted. A summary of converted / skipped / failed files is
+printed at the end.
+
+Equivalent command line:
+
+```cmd
+python convert.py --batch "D:\Wii\ISO" --to wbfs --output "D:\Wii\wbfs"
+```
+
+Useful flags:
+
+| Flag | Effect |
+|---|---|
+| `--batch [FOLDER]` | Batch mode. Without a folder, uses `[batch] input_iso` from `config.ini` |
+| `--to rvz\|wbfs` | Target format for ISO input; skips the Yes/No dialog |
+| `--output FOLDER` | Output folder, overrides `config.ini` |
+| `--overwrite` | Re-convert files that already exist in the output folder |
+| `--no-pause` | Do not wait for ENTER at the end (for scripts/schedulers) |
 
 ### Method 1 — Drag & drop with `convert.bat`
 
@@ -161,6 +200,7 @@ If you downloaded the precompiled release:
 python convert.py "C:\Games\SuperMarioGalaxy.rvz"
 python convert.py "C:\Games\Zelda.wbfs"
 python convert.py "C:\Games\MetroidPrime3.iso"
+python convert.py "C:\Games\MetroidPrime3.iso" --to wbfs
 ```
 
 ---
@@ -171,6 +211,9 @@ When the input file is an **ISO**, the program opens a native Windows **Yes/No**
 
 - **Yes** → convert to **RVZ**
 - **No** → convert to **WBFS**
+
+Pass `--to rvz` or `--to wbfs` on the command line to skip the dialog.
+Only the tool the chosen flow needs is required: ISO → WBFS works with just `wit.exe`.
 
 The original ISO file is never deleted.
 
