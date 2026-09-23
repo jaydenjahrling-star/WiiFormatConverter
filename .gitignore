@@ -16,3 +16,6 @@ __pycache__/
 
 # Local user configuration
 config.ini
+
+# Automatically downloaded tools (wit.exe etc.)
+tools/
