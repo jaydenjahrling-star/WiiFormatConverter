@@ -17,6 +17,11 @@ ISO -> WBFS : direct WIT conversion (original ISO is NOT deleted)
 Only the tool a flow needs is required. wit.exe is downloaded automatically
 (into .\\tools\\wit\\) when it cannot be found, so ISO -> WBFS needs nothing
 but Python.
+
+NKit images (*.nkit.iso, "NKIT" magic at 0x200) are not real ISOs and wit
+cannot read them. They are handled with NKit 2 (downloaded automatically into
+.\\tools\\nkit\\): either converted straight to WBFS, or expanded to a full
+ISO first and then passed to wit.
 """
 
 import sys
@@ -82,6 +87,9 @@ DEFAULT_CONFIG = """\
 # wit.exe is downloaded automatically into .\\tools\\wit\\ if it cannot be found.
 dolphin_tool =
 wit_tool =
+# NKit 2 command line tool (nkit.exe), only needed for *.nkit.iso images.
+# Downloaded automatically into .\\tools\\nkit\\ if it cannot be found.
+nkit_tool =
 
 [output]
 output_rvz = .\\RVZ
@@ -96,21 +104,40 @@ input_iso = D:\\Wii\\ISO
 output_wbfs = D:\\Wii\\wbfs
 # Output file name. Placeholders: {name} = ISO file name, {id} = 6-char game ID, {title} = disc title
 name_format = {name} [{id}]
+# How *.nkit.iso images are handled: wbfs = NKit writes the WBFS directly (fast, no temp file)
+#                                     iso  = NKit restores a full ISO first, then wit makes the WBFS
+# If "wbfs" fails for a game, "iso" is tried automatically.
+nkit_mode = wbfs
 """
 
-# ── WIT auto-download ────────────────────────────────────────────────────────
-# Official builds from https://wit.wiimm.de/download.html (Wiimms ISO Tools, GPL-2.0).
+# ── Tool auto-download ───────────────────────────────────────────────────────
+# WIT : official builds from https://wit.wiimm.de/download.html (Wiimms ISO Tools, GPL-2.0)
+# NKit: official builds from https://github.com/Nanook/NKit/releases (self-contained, no .NET needed)
 WIT_VERSION = "v3.05a-r8638"
-WIT_DOWNLOADS = {
-    # key: (url, sha256, folder inside the zip that holds wit.exe + its DLLs)
-    "win64": (f"https://wit.wiimm.de/download/wit-{WIT_VERSION}-cygwin64.zip",
-              "049670558970f0cea2796d68e0ba1e48491474b5708bf12a95ab8a185f4e59c1",
-              f"wit-{WIT_VERSION}-cygwin64/bin"),
-    "win32": (f"https://wit.wiimm.de/download/wit-{WIT_VERSION}-cygwin32.zip",
-              "c939189f19454fce0c50a92e368d5ec5430e690002d5095de48a6fcc8e4ecd33",
-              f"wit-{WIT_VERSION}-cygwin32/bin"),
+NKIT_VERSION = "2.1.0"
+TOOL_DOWNLOADS = {
+    # key -> arch -> (url, sha256, folder inside the zip that holds the exe; "" = whole zip)
+    "wit_tool": {
+        "win64": (f"https://wit.wiimm.de/download/wit-{WIT_VERSION}-cygwin64.zip",
+                  "049670558970f0cea2796d68e0ba1e48491474b5708bf12a95ab8a185f4e59c1",
+                  f"wit-{WIT_VERSION}-cygwin64/bin"),
+        "win32": (f"https://wit.wiimm.de/download/wit-{WIT_VERSION}-cygwin32.zip",
+                  "c939189f19454fce0c50a92e368d5ec5430e690002d5095de48a6fcc8e4ecd33",
+                  f"wit-{WIT_VERSION}-cygwin32/bin"),
+    },
+    "nkit_tool": {
+        "win64": (f"https://github.com/Nanook/NKit/releases/download/v{NKIT_VERSION}/NKit_CLI_win-x64_{NKIT_VERSION}.zip",
+                  "e2a66cc9b6c3e22aa5fa3d7a4c245a5d35efe0c757e5db2ffcb8690f33537e97",
+                  ""),
+        "winarm64": (f"https://github.com/Nanook/NKit/releases/download/v{NKIT_VERSION}/NKit_CLI_win-arm64_{NKIT_VERSION}.zip",
+                     "6e152e37b949330ee40cda1b8b241a98c7329851f87f86b3a8f61b7046b334de",
+                     ""),
+    },
 }
+TOOL_LABELS = {"wit_tool": "Wiimms ISO Tools " + WIT_VERSION, "nkit_tool": "NKit " + NKIT_VERSION}
+TOOL_SUBDIRS = {"wit_tool": "wit", "nkit_tool": "nkit", "dolphin_tool": "dolphin"}
 WIT_EXE_NAME = "wit.exe" if IS_WINDOWS else "wit"
+NKIT_EXE_NAME = "nkit.exe" if IS_WINDOWS else "nkit"
 DOLPHIN_EXE_NAME = "DolphinTool.exe" if IS_WINDOWS else "dolphin-tool"
 
 def _user_tools_dir() -> Path:
@@ -138,13 +165,21 @@ TOOL_CANDIDATES = {
         r"C:\wit\wit.exe",
         r"C:\wit\bin\wit.exe",
     ],
+    "nkit_tool": [
+        NKIT_EXE_NAME,
+        r"C:\NKit\nkit.exe",
+        r"C:\Program Files\NKit\nkit.exe",
+    ],
 }
+# Smoke-test arguments and accepted exit codes per tool (nkit without parameters exits 2)
+TOOL_SMOKE = {"wit_tool": (("--version",), {0}), "nkit_tool": ((), {0, 2}), "dolphin_tool": (("--version",), {0})}
 
-def _tool_runs(exe: Path, args=("--version",)) -> bool:
-    """Smoke test: the binary starts and exits cleanly (catches missing DLLs)."""
+def _tool_runs(exe: Path, args=("--version",), ok_codes=frozenset({0})) -> bool:
+    """Smoke test: the binary starts and exits as expected (catches missing DLLs, AV blocks)."""
     try:
-        r = subprocess.run([str(exe), *args], capture_output=True, timeout=60)
-        return r.returncode == 0
+        r = subprocess.run([str(exe), *args], capture_output=True, timeout=120,
+                           cwd=str(exe.parent))
+        return r.returncode in ok_codes
     except Exception:
         return False
 
@@ -184,8 +219,9 @@ def _download(url: str, dest: Path, expected_sha256: str = ""):
     tmp.replace(dest)
 
 def _extract_subdir(zip_path: Path, subdir: str, target: Path):
-    """Extract everything under <subdir>/ in the zip into target (flattened to target/)."""
-    prefix = subdir.strip("/").replace("\\", "/") + "/"
+    """Extract everything under <subdir>/ in the zip into target (flattened to target/).
+    An empty subdir extracts the whole archive."""
+    prefix = (subdir.strip("/").replace("\\", "/") + "/") if subdir.strip("/") else ""
     target.mkdir(parents=True, exist_ok=True)
     count = 0
     with zipfile.ZipFile(zip_path) as zf:
@@ -217,42 +253,55 @@ def _writable_dir(candidates):
             continue
     return None
 
-def install_wit() -> Path:
-    """Download the official WIT build and unpack wit.exe (+DLLs) into tools/wit/."""
-    if os.environ.get("WII_CONV_WIT_URL"):  # test / advanced override
-        url = os.environ["WII_CONV_WIT_URL"]
-        sha = os.environ.get("WII_CONV_WIT_SHA256", "")
-        subdir = os.environ.get("WII_CONV_WIT_SUBDIR", "bin")
+def install_tool(key: str) -> Path:
+    """Download an official build of wit / nkit and unpack it into tools/<name>/."""
+    env = key.split("_")[0].upper()          # WIT / NKIT
+    exe_name = TOOL_CANDIDATES[key][0]
+    if os.environ.get(f"WII_CONV_{env}_URL"):  # test / advanced override
+        url = os.environ[f"WII_CONV_{env}_URL"]
+        sha = os.environ.get(f"WII_CONV_{env}_SHA256", "")
+        subdir = os.environ.get(f"WII_CONV_{env}_SUBDIR", "")
     else:
         if not IS_WINDOWS:
-            raise RuntimeError("Automatic WIT download is only available on Windows. "
-                               "Install wit from https://wit.wiimm.de/ and set wit_tool in config.ini.")
-        is64 = platform.machine().upper() not in ("X86", "I386", "I686", "")
-        url, sha, subdir = WIT_DOWNLOADS["win64" if is64 else "win32"]
+            raise RuntimeError(f"Automatic download of {exe_name} is only available on Windows. "
+                               f"Install it manually and set {key} in config.ini.")
+        machine = platform.machine().upper()
+        if machine in ("ARM64", "AARCH64") and "winarm64" in TOOL_DOWNLOADS[key]:
+            arch = "winarm64"
+        elif machine in ("X86", "I386", "I686") and "win32" in TOOL_DOWNLOADS[key]:
+            arch = "win32"
+        else:
+            arch = "win64"
+        url, sha, subdir = TOOL_DOWNLOADS[key][arch]
 
     tools_dir = _writable_dir(TOOLS_DIRS)
     if tools_dir is None:
         raise RuntimeError("No writable folder for tools (tried: "
                            + ", ".join(str(d) for d in TOOLS_DIRS) + ")")
-    wit_dir = tools_dir / "wit"
+    tool_dir = tools_dir / TOOL_SUBDIRS[key]
     zip_path = tools_dir / Path(url.split("?")[0]).name
 
-    info(f"Downloading Wiimms ISO Tools {WIT_VERSION}")
+    info(f"Downloading {TOOL_LABELS[key]}")
     info(f"From : {url}")
-    info(f"To   : {wit_dir}")
+    info(f"To   : {tool_dir}")
     _download(url, zip_path, sha)
     if sha:
         ok("Checksum verified (SHA-256)")
-    n = _extract_subdir(zip_path, subdir, wit_dir)
+    n = _extract_subdir(zip_path, subdir, tool_dir)
     zip_path.unlink(missing_ok=True)
-    exe = wit_dir / WIT_EXE_NAME
+    exe = tool_dir / exe_name
+    if not exe.exists():   # exe somewhere deeper in the archive?
+        found = [p for p in tool_dir.rglob(exe_name) if p.is_file()]
+        if found:
+            exe = found[0]
     if n == 0 or not exe.exists():
-        raise RuntimeError(f"{WIT_EXE_NAME} not found inside the downloaded archive ({subdir}/)")
+        raise RuntimeError(f"{exe_name} not found inside the downloaded archive")
     ok(f"Unpacked {n} file(s)")
-    if not _tool_runs(exe):
+    smoke_args, ok_codes = TOOL_SMOKE[key]
+    if not _tool_runs(exe, smoke_args, ok_codes):
         raise RuntimeError(f"{exe} was unpacked but does not start. "
-                           "Try installing WIT manually from https://wit.wiimm.de/")
-    ok(f"WIT ready: {exe}")
+                           "If your antivirus quarantined it, restore/allow it and run again.")
+    ok(f"Ready: {exe}")
     return exe
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -295,7 +344,7 @@ def resolve_tool(cfg, key, allow_download=True):
             return (configured / exe_name).resolve(), True
         warn(f"Configured {key} does not exist: {configured} - trying auto-detection")
 
-    sub = "wit" if key == "wit_tool" else "dolphin"
+    sub = TOOL_SUBDIRS[key]
     for d in [BASE_DIR] + [t / sub for t in TOOLS_DIRS] + list(TOOLS_DIRS):
         c = d / exe_name
         if c.is_file():
@@ -310,15 +359,19 @@ def resolve_tool(cfg, key, allow_download=True):
         if c.is_file():
             return c.resolve(), True
 
-    if key == "wit_tool" and allow_download:
+    if key in TOOL_DOWNLOADS and allow_download:
         warn(f"{exe_name} not found anywhere - downloading it now")
         try:
-            return install_wit(), True
+            return install_tool(key), True
         except (RuntimeError, OSError, urllib.error.URLError, zipfile.BadZipFile) as exc:
-            error(f"Automatic WIT download failed: {exc}")
-            error("Manual fix: download the cygwin64 zip from https://wit.wiimm.de/download.html,")
-            error(f"unzip it, and copy the whole 'bin' folder contents to: {BASE_DIR / 'tools' / 'wit'}")
-            error("(or set wit_tool in config.ini to your wit.exe)")
+            error(f"Automatic download of {exe_name} failed: {exc}")
+            if key == "wit_tool":
+                error("Manual fix: download the cygwin64 zip from https://wit.wiimm.de/download.html,")
+                error(f"unzip it, and copy the whole 'bin' folder contents to: {BASE_DIR / 'tools' / 'wit'}")
+            else:
+                error("Manual fix: download NKit_CLI_win-x64_*.zip from https://github.com/Nanook/NKit/releases,")
+                error(f"and unzip it into: {BASE_DIR / 'tools' / 'nkit'}")
+            error(f"(or set {key} in config.ini to the .exe)")
 
     return (configured or Path(exe_name)), False
 
@@ -336,12 +389,14 @@ def get_output_dir(cfg, fmt: str, override: str = None) -> Path:
 # ── Disc headers ─────────────────────────────────────────────────────────────
 WII_MAGIC = 0x5D1C9EA3   # big-endian at disc offset 0x18
 GC_MAGIC = 0xC2339F3D    # big-endian at disc offset 0x1C
+NKIT_MAGIC = b"NKIT"     # at disc offset 0x200 in NKit images (same check Dolphin uses)
 
 def read_disc_header(path: Path):
     """
-    Return {'id': 'RMGE01', 'title': '...', 'wii': bool, 'gc': bool} for a plain
-    .iso or a .wbfs file, or None if the header cannot be read / is not a disc.
+    Return {'id': 'RMGE01', 'title': '...', 'wii': bool, 'gc': bool, 'nkit': bool}
+    for a plain .iso or a .wbfs file, or None if the header cannot be read / is not a disc.
     """
+    nkit = False
     try:
         with open(path, "rb") as f:
             if path.suffix.lower() == ".wbfs":
@@ -349,7 +404,11 @@ def read_disc_header(path: Path):
                 if len(head) < 16 or head[:4] != b"WBFS":
                     return None
                 f.seek(1 << head[8])   # first disc header copy = second HD sector
-            hdr = f.read(0x60)
+                hdr = f.read(0x60)
+            else:
+                hdr = f.read(0x60)
+                f.seek(0x200)
+                nkit = f.read(4) == NKIT_MAGIC
     except OSError:
         return None
     if len(hdr) < 0x60:
@@ -360,7 +419,13 @@ def read_disc_header(path: Path):
     wii = struct.unpack(">I", hdr[0x18:0x1C])[0] == WII_MAGIC
     gc = struct.unpack(">I", hdr[0x1C:0x20])[0] == GC_MAGIC
     title = hdr[0x20:0x60].split(b"\0", 1)[0].decode("ascii", "replace").strip()
-    return {"id": id6.decode("ascii"), "title": title, "wii": wii, "gc": gc}
+    return {"id": id6.decode("ascii"), "title": title, "wii": wii, "gc": gc, "nkit": nkit}
+
+def is_nkit_image(path: Path, hdr=None) -> bool:
+    """NKit images carry 'NKIT' at 0x200; the file name usually says so too."""
+    if ".nkit." in path.name.lower():
+        return True
+    return bool(hdr and hdr.get("nkit"))
 
 def index_existing_wbfs(out_dir: Path) -> dict:
     """Map game ID -> path for every .wbfs already under out_dir (any naming scheme)."""
@@ -389,6 +454,8 @@ def safe_filename(name: str) -> str:
 def wbfs_name_for(source: Path, hdr, name_format: str) -> str:
     """Build the .wbfs file name (without extension) from the configured format."""
     stem = source.stem
+    if stem.lower().endswith(".nkit"):      # "Game (USA).nkit.iso" -> "Game (USA)"
+        stem = stem[:-5]
     if not hdr:
         return stem
     if hdr["id"] in stem.upper():          # already named like "Title [RMGE01]" or "RMGE01"
@@ -447,11 +514,30 @@ def run_cmd(cmd: list, desc: str) -> bool:
         error(f"{desc} could not start: {exc}")
         return False
     elapsed = time.time() - t0
+    _enable_ansi()   # cygwin programs (wit) reset the console mode when they exit
     if result.returncode != 0:
         error(f"{desc} failed (exit code {result.returncode})")
         return False
     ok(f"{desc} completed in {elapsed:.1f}s")
     return True
+
+def run_cmd_code(cmd: list, desc: str) -> int:
+    """Like run_cmd but returns the exit code (-1 if it could not start)."""
+    info(f"Command: {' '.join(str(c) for c in cmd)}")
+    print()
+    t0 = time.time()
+    try:
+        result = subprocess.run(cmd)
+    except OSError as exc:
+        error(f"{desc} could not start: {exc}")
+        return -1
+    _enable_ansi()
+    elapsed = time.time() - t0
+    if result.returncode == 0:
+        ok(f"{desc} completed in {elapsed:.1f}s")
+    else:
+        warn(f"{desc} exited with code {result.returncode} after {elapsed:.1f}s")
+    return result.returncode
 
 def print_sizes(src: Path, dst: Path, show_ratio=False):
     mb_src = src.stat().st_size / 1_048_576
@@ -584,14 +670,42 @@ def convert_iso_to_rvz(source: Path, cfg, dolphin: Path, out_dir: Path = None):
         print_sizes(source, dest, show_ratio=True)
     return True
 
+BATCH_WARNINGS = []   # (file name, message) collected for the batch summary
+
+def _largest(files):
+    return max(files, key=lambda p: p.stat().st_size)
+
+def nkit_run(nkit: Path, source: Path, work_dir: Path, task: str, want_ext: str,
+             convert_fmt: str = None):
+    """
+    Run NKit on one image with a throw-away work folder.
+    Returns (exit_code, [produced files with want_ext]).
+    NKit exit codes: 0 ok, 1 finished but reported a problem (e.g. verification),
+    2 bad parameters, 3 config error, 6 unknown error, 7 cancelled.
+    """
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [str(nkit), "-cfg", "n", "-task", task,
+           "-in", str(source), "-out", str(work_dir), "-tmp", str(work_dir),
+           "-r", "n", "-arc", "n", "-results", "n", "-consoleLevel", "info"]
+    if convert_fmt:
+        cmd += ["-convert", convert_fmt]
+    code = run_cmd_code(cmd, f"nkit {task}")
+    files = [p for p in work_dir.rglob("*")
+             if p.is_file() and p.suffix.lower() == want_ext and p.stat().st_size > 0]
+    return code, files
+
 def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
                         skip_existing: bool = False, existing_index: dict = None,
-                        name_format: str = "{name}", split: bool = False):
+                        name_format: str = "{name}", split: bool = False,
+                        nkit: Path = None, nkit_mode: str = "wbfs"):
     """
     ISO -> WBFS. The original ISO is NOT deleted.
     Writes into <out_dir>/.incomplete/ first and moves the result into place
-    only when wit succeeds, so an interrupted run never leaves a file that
-    looks finished.
+    only when the conversion succeeds, so an interrupted run never leaves a
+    file that looks finished.
+    NKit images are converted with NKit (directly to WBFS, or expanded to a
+    full ISO and then passed to wit), because wit cannot read them.
     Returns True (converted), False (failed) or None (skipped).
     """
     if out_dir is None:
@@ -599,10 +713,11 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
     hdr = read_disc_header(source)
     base = wbfs_name_for(source, hdr, name_format)
     dest = out_dir / (base + ".wbfs")
+    nkit_img = is_nkit_image(source, hdr)
 
     if hdr:
         kind = "Wii" if hdr["wii"] else ("GameCube" if hdr["gc"] else "unknown type")
-        info(f"Disc   : {hdr['id']}  {hdr['title']}  ({kind})")
+        info(f"Disc   : {hdr['id']}  {hdr['title']}  ({kind}{', NKit image' if nkit_img else ''})")
         if not hdr["wii"] and not hdr["gc"]:
             warn("Header has no Wii/GameCube magic - this may not be a disc image")
     else:
@@ -627,16 +742,65 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
     stage_dir = out_dir / STAGING_NAME
     stage_dir.mkdir(parents=True, exist_ok=True)
     staged = stage_dir / dest.name
+    split_args = ["--split"] if split else []   # wit picks a FAT-safe part size itself
 
-    step(1, "ISO -> WBFS (wit)")
-    info(f"Source : {source}")
-    info(f"Dest   : {dest}")
-    cmd = [str(wit), "copy", str(source), str(staged), "--wbfs", "--overwrite"]
-    if split:
-        cmd += ["--split", "--split-size", "4G-32K"]
-    success = run_cmd(cmd, "ISO -> WBFS")
+    if nkit_img:
+        info("NKit image: wit cannot read these, NKit restores it first")
+        if nkit is None:
+            error("nkit.exe is not available (see the messages above) - cannot convert this NKit image")
+            return False
+        work = stage_dir / (safe_filename(base) + ".nkit-work")
+        success = False
+        try:
+            if nkit_mode != "iso":
+                step(1, "NKit image -> WBFS (nkit)")
+                info(f"Source : {source}")
+                info(f"Dest   : {dest}")
+                code, files = nkit_run(nkit, source, work, "convert", ".wbfs", "wbfs")
+                if files and code in (0, 1):
+                    produced = _largest(files)
+                    if staged.exists():
+                        staged.unlink()
+                    shutil.move(str(produced), str(staged))
+                    if code == 1:
+                        warn("NKit finished but reported a problem (verification?) - the WBFS was kept")
+                        BATCH_WARNINGS.append((source.name, "NKit reported a problem, output kept"))
+                    success = True
+                else:
+                    warn("Direct NKit -> WBFS did not work, trying NKit -> full ISO -> wit")
+            if not success:
+                full_iso = 4_800 * 1_048_576   # a full single-layer Wii ISO is 4.38 GiB
+                if not enough_space(out_dir, needed + full_iso):
+                    free = shutil.disk_usage(out_dir).free / 1_073_741_824
+                    error(f"Not enough free space on {out_dir.anchor or out_dir} for the temporary "
+                          f"full ISO ({free:.1f} GB free, about {(needed + full_iso) / 1_073_741_824:.1f} GB needed)")
+                    return False
+                step(1, "NKit image -> full ISO (nkit, temporary file)")
+                info(f"Source : {source}")
+                info(f"Work   : {work}")
+                code, files = nkit_run(nkit, source, work, "expand", ".iso")
+                if not files or code not in (0, 1):
+                    error(f"NKit could not restore this image (exit code {code})")
+                    return False
+                iso_tmp = _largest(files)
+                if code == 1:
+                    warn("NKit finished but reported a problem (verification?) - continuing with the restored ISO")
+                    BATCH_WARNINGS.append((source.name, "NKit reported a problem, output kept"))
+                step(2, "ISO -> WBFS (wit)")
+                info(f"Temp ISO : {iso_tmp}")
+                info(f"Dest     : {dest}")
+                success = run_cmd([str(wit), "copy", str(iso_tmp), str(staged),
+                                   "--wbfs", "--overwrite", *split_args], "ISO -> WBFS")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    else:
+        step(1, "ISO -> WBFS (wit)")
+        info(f"Source : {source}")
+        info(f"Dest   : {dest}")
+        success = run_cmd([str(wit), "copy", str(source), str(staged),
+                           "--wbfs", "--overwrite", *split_args], "ISO -> WBFS")
 
-    # Everything wit produced for this game (name.wbfs, and name.wbf1... when split)
+    # Everything produced for this game (name.wbfs, and name.wbf1... when split)
     parts = sorted(p for p in stage_dir.iterdir()
                    if p.is_file() and p.stem == staged.stem)
     if not success:
@@ -646,7 +810,7 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
             warn("Removed partial output")
         return False
     if not parts or not staged.exists() or staged.stat().st_size == 0:
-        error("wit reported success but produced no output file")
+        error("The converter reported success but produced no output file")
         for p in parts:
             p.unlink(missing_ok=True)
         return False
@@ -657,7 +821,7 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
             final.unlink()
         shutil.move(str(p), str(final))
 
-    step(2, "Result")
+    step("*", "Result")
     ok(f"Created file: {dest}")
     if len(parts) > 1:
         ok(f"Split into {len(parts)} parts (FAT32 4 GB limit)")
@@ -668,10 +832,20 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
         existing_index.setdefault(hdr["id"], dest)
     return True
 
+def optional_tool(cfg, key, label, allow_download):
+    """Like require_tool but returns None instead of exiting when the tool is missing."""
+    tool, found = resolve_tool(cfg, key, allow_download=allow_download)
+    if not found:
+        error(f"{label} not found: {tool}")
+        return None
+    ok(f"{label:<11} : {tool}")
+    return tool
+
 def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
-                      overwrite: bool = False) -> bool:
+                      overwrite: bool = False, allow_download: bool = True) -> bool:
     """Convert every .iso under in_dir to .wbfs in out_dir. Returns True if nothing failed."""
     name_format = cfg.get("batch", "name_format", fallback="{name} [{id}]").strip() or "{name}"
+    nkit_mode = cfg.get("batch", "nkit_mode", fallback="wbfs").strip().lower() or "wbfs"
     out_res = out_dir.resolve()
 
     isos = []
@@ -700,9 +874,18 @@ def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
     if existing:
         info(f"{len(existing)} game(s) already present in {out_dir}")
 
+    nkit_count = sum(1 for p in isos if is_nkit_image(p, read_disc_header(p)))
+    nkit = None
+    if nkit_count:
+        info(f"{nkit_count} of {len(isos)} file(s) are NKit images (*.nkit.iso) - NKit is needed for those")
+        nkit = optional_tool(cfg, "nkit_tool", "NKit", allow_download)
+        if nkit is None:
+            warn("NKit images will be reported as failed; plain ISOs are still converted")
+
     info(f"Found {len(isos)} ISO file(s) in {in_dir}")
     print()
     converted, skipped, failed = [], [], []
+    BATCH_WARNINGS.clear()
     t0 = time.time()
 
     for i, iso in enumerate(isos, 1):
@@ -712,7 +895,8 @@ def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
             res = convert_iso_to_wbfs(iso, cfg, wit, out_dir=out_dir,
                                       skip_existing=not overwrite,
                                       existing_index=existing,
-                                      name_format=name_format, split=split)
+                                      name_format=name_format, split=split,
+                                      nkit=nkit, nkit_mode=nkit_mode)
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # keep going with the rest of the folder
@@ -734,10 +918,16 @@ def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
     print(f"\n{BOLD}{CYAN}=========== Batch summary ==========={RESET}")
     ok(f"Converted : {len(converted)}")
     warn(f"Skipped   : {len(skipped)} (already in {out_dir})")
+    if BATCH_WARNINGS:
+        warn(f"Warnings  : {len(BATCH_WARNINGS)}")
+        for name, msg in BATCH_WARNINGS:
+            warn(f"   - {name}: {msg}")
     if failed:
         error(f"Failed    : {len(failed)}")
         for name in failed:
             error(f"   - {name}")
+        if nkit_count and nkit is None:
+            error("NKit images could not be converted because nkit.exe is missing (see above).")
     else:
         ok("Failed    : 0")
     info(f"Total time: {elapsed / 60:.1f} min")
@@ -761,7 +951,7 @@ def parse_args(argv):
     parser.add_argument("--overwrite", action="store_true",
                         help="Batch mode: re-convert games that already exist in the output folder.")
     parser.add_argument("--no-download", action="store_true",
-                        help="Never download wit.exe automatically.")
+                        help="Never download wit.exe / nkit.exe automatically.")
     parser.add_argument("--no-pause", action="store_true",
                         help="Do not wait for ENTER before exiting.")
     return parser.parse_args(argv)
@@ -854,7 +1044,8 @@ def main():
         step(1, "Checking tools")
         wit = require_tool(cfg, "wit_tool", "WIT", allow_download)
 
-        success = batch_iso_to_wbfs(in_dir, out_dir, cfg, wit, overwrite=args.overwrite)
+        success = batch_iso_to_wbfs(in_dir, out_dir, cfg, wit, overwrite=args.overwrite,
+                                    allow_download=allow_download)
         print()
         if success:
             print(f"{BOLD}{GREEN}OK Batch conversion completed successfully!{RESET}")
@@ -914,13 +1105,21 @@ def main():
     elif ext == ".rvz":
         success = convert_rvz_to_wbfs(source, cfg, dolphin, wit, out_dir=out_dir)
     elif ext == ".iso" and iso_target_fmt == "rvz":
+        if is_nkit_image(source, read_disc_header(source)):
+            warn("This is an NKit image: DolphinTool will produce an NKit-based RVZ, not a full one.")
         success = convert_iso_to_rvz(source, cfg, dolphin, out_dir=out_dir)
     else:
         name_format = cfg.get("batch", "name_format", fallback="{name} [{id}]").strip() or "{name}"
+        nkit_mode = cfg.get("batch", "nkit_mode", fallback="wbfs").strip().lower() or "wbfs"
         fs = filesystem_name(out_dir)
         split = fs is not None and fs.upper().startswith("FAT")
+        nkit = None
+        if is_nkit_image(source, read_disc_header(source)):
+            info("This is an NKit image - NKit is needed to restore it")
+            nkit = optional_tool(cfg, "nkit_tool", "NKit", allow_download)
         success = convert_iso_to_wbfs(source, cfg, wit, out_dir=out_dir,
-                                      name_format=name_format, split=split)
+                                      name_format=name_format, split=split,
+                                      nkit=nkit, nkit_mode=nkit_mode)
 
     print()
     if success:
