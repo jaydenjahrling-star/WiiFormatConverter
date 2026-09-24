@@ -941,10 +941,11 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
                     warn("Direct NKit -> WBFS did not work, trying NKit -> full ISO -> wit")
             if not success:
                 full_iso = 4_800 * 1_048_576   # a full single-layer Wii ISO is 4.38 GiB
-                if not enough_space(out_dir, needed + full_iso):
-                    free = shutil.disk_usage(out_dir).free / 1_073_741_824
+                free = shutil.disk_usage(out_dir).free
+                if free < full_iso:
                     error(f"Not enough free space on {out_dir.anchor or out_dir} for the temporary "
-                          f"full ISO ({free:.1f} GB free, about {(needed + full_iso) / 1_073_741_824:.1f} GB needed)")
+                          f"full ISO ({free / 1_073_741_824:.1f} GB free, about "
+                          f"{full_iso / 1_073_741_824:.1f} GB needed)")
                     return False
                 step(1, "NKit image -> full ISO (nkit, temporary file)")
                 info(f"Source : {source}")
