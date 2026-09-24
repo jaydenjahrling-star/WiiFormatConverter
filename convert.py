@@ -26,6 +26,7 @@ ISO first and then passed to wit.
 
 import sys
 import os
+import re
 import subprocess
 import configparser
 import time
@@ -194,12 +195,40 @@ def _tool_starts(exe: Path, args=()):
         return False, f"exit code {code} (0x{code & 0xFFFFFFFF:08X}) {out[-300:]}".strip()
     return True, f"exit code {code}"
 
+def _download_with_curl(url: str, tmp: Path) -> bool:
+    """Fallback for a Python whose certificate store cannot verify the site: Windows 10+
+    ships curl.exe, which uses the system certificate store."""
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        return False
+    warn("Retrying the download with curl ...")
+    try:
+        r = subprocess.run([curl, "-L", "--fail", "--silent", "--show-error", "-o", str(tmp), url],
+                           timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0
+
 def _download(url: str, dest: Path, expected_sha256: str = ""):
     """Download url to dest with a progress line; verify sha256 when given."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        _download_urllib(url, tmp)
+    except (urllib.error.URLError, OSError) as exc:
+        if not (IS_WINDOWS and _download_with_curl(url, tmp)):
+            raise
+        warn(f"(urllib failed first: {exc})")
+    digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    if expected_sha256 and digest.lower() != expected_sha256.lower():
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"SHA-256 mismatch for {url}\n"
+                           f"      expected {expected_sha256}\n"
+                           f"      got      {digest}")
+    tmp.replace(dest)
+
+def _download_urllib(url: str, tmp: Path):
     req = urllib.request.Request(url, headers={"User-Agent": "WiiFormatConverter/1.1"})
-    h = hashlib.sha256()
     with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
         total = int(resp.headers.get("Content-Length") or 0)
         done = 0
@@ -209,7 +238,6 @@ def _download(url: str, dest: Path, expected_sha256: str = ""):
             if not chunk:
                 break
             out.write(chunk)
-            h.update(chunk)
             done += len(chunk)
             now = time.time()
             if now - t_last > 0.25 or done == total:
@@ -221,13 +249,6 @@ def _download(url: str, dest: Path, expected_sha256: str = ""):
                 else:
                     print(f"\r    {done / 1_048_576:6.1f} MB", end="", flush=True)
     print()
-    digest = h.hexdigest()
-    if expected_sha256 and digest.lower() != expected_sha256.lower():
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"SHA-256 mismatch for {url}\n"
-                           f"      expected {expected_sha256}\n"
-                           f"      got      {digest}")
-    tmp.replace(dest)
 
 def _extract_subdir(zip_path: Path, subdir: str, target: Path):
     """Extract everything under <subdir>/ in the zip into target (flattened to target/).
@@ -290,6 +311,7 @@ def install_tool(key: str) -> Path:
         raise RuntimeError("No writable folder for tools (tried: "
                            + ", ".join(str(d) for d in TOOLS_DIRS) + ")")
     tool_dir = tools_dir / TOOL_SUBDIRS[key]
+    tmp_dir = tools_dir / (TOOL_SUBDIRS[key] + ".unpacking")
     zip_path = tools_dir / Path(url.split("?")[0]).name
 
     info(f"Downloading {TOOL_LABELS[key]}")
@@ -298,8 +320,12 @@ def install_tool(key: str) -> Path:
     _download(url, zip_path, sha)
     if sha:
         ok("Checksum verified (SHA-256)")
-    n = _extract_subdir(zip_path, subdir, tool_dir)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    n = _extract_subdir(zip_path, subdir, tmp_dir)
     zip_path.unlink(missing_ok=True)
+    # Only now replace the tool folder, so a crash while unpacking never leaves a half tool behind
+    shutil.rmtree(tool_dir, ignore_errors=True)
+    tmp_dir.replace(tool_dir)
     exe = tool_dir / exe_name
     if not exe.exists():   # exe somewhere deeper in the archive?
         found = [p for p in tool_dir.rglob(exe_name) if p.is_file()]
@@ -319,8 +345,23 @@ def install_tool(key: str) -> Path:
     return exe
 
 # ── Config ───────────────────────────────────────────────────────────────────
+def _new_config():
+    # interpolation=None: a '%' in a path or name_format must never be interpreted
+    return configparser.ConfigParser(interpolation=None)
+
+def _decode_text_file(raw: bytes) -> str:
+    """Decode a text file saved by any Windows editor (UTF-8, UTF-8 BOM, UTF-16, ANSI)."""
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", "replace")
+
 def load_config():
-    cfg = configparser.ConfigParser()
+    cfg = _new_config()
     if not CONFIG_FILE.exists():
         info(f"config.ini not found - creating it with default settings: {CONFIG_FILE}")
         try:
@@ -330,12 +371,19 @@ def load_config():
             cfg.read_string(DEFAULT_CONFIG)
             return cfg
     try:
-        cfg.read(CONFIG_FILE, encoding="utf-8")
-    except configparser.Error as exc:
-        warn(f"config.ini could not be parsed ({exc}); continuing with built-in defaults.")
-        cfg = configparser.ConfigParser()
+        cfg.read_string(_decode_text_file(CONFIG_FILE.read_bytes()))
+    except (configparser.Error, OSError, UnicodeError) as exc:
+        warn(f"config.ini could not be read ({exc}); continuing with built-in defaults.")
+        cfg = _new_config()
         cfg.read_string(DEFAULT_CONFIG)
     return cfg
+
+def cfg_path(value: str) -> str:
+    """Config values may be written with quotes or a trailing backslash; normalise them."""
+    v = (value or "").strip().strip('"').strip("'").strip()
+    while len(v) > 3 and v.endswith(("\\", "/")):
+        v = v[:-1]
+    return v
 
 def resolve_tool(cfg, key, allow_download=True):
     """
@@ -345,7 +393,7 @@ def resolve_tool(cfg, key, allow_download=True):
     Returns (path, found).
     """
     exe_name = TOOL_CANDIDATES[key][0]
-    raw = cfg.get("paths", key, fallback="").strip()
+    raw = cfg_path(cfg.get("paths", key, fallback=""))
     configured = None
     if raw:
         configured = Path(raw)
@@ -392,7 +440,7 @@ def resolve_tool(cfg, key, allow_download=True):
 def get_output_dir(cfg, fmt: str, override: str = None) -> Path:
     key = "output_rvz" if fmt == "rvz" else "output_wbfs"
     default = f".\\{fmt.upper()}"
-    raw = (override or cfg.get("output", key, fallback=default)).strip()
+    raw = cfg_path(override or cfg.get("output", key, fallback=default)) or default
     p = Path(raw)
     if not p.is_absolute():
         p = BASE_DIR / p
@@ -415,7 +463,7 @@ def read_disc_header(path: Path):
         with open(path, "rb") as f:
             if path.suffix.lower() == ".wbfs":
                 head = f.read(16)
-                if len(head) < 16 or head[:4] != b"WBFS":
+                if len(head) < 16 or head[:4] != b"WBFS" or not 9 <= head[8] <= 16:
                     return None
                 f.seek(1 << head[8])   # first disc header copy = second HD sector
                 hdr = f.read(0x60)
@@ -423,17 +471,68 @@ def read_disc_header(path: Path):
                 hdr = f.read(0x60)
                 f.seek(0x200)
                 nkit = f.read(4) == NKIT_MAGIC
-    except OSError:
+    except Exception:          # OSError, OverflowError on garbage headers, ...
         return None
     if len(hdr) < 0x60:
         return None
     id6 = hdr[:6]
     if not all(0x30 <= b <= 0x5A or 0x61 <= b <= 0x7A for b in id6):
         return None
+    disc = hdr[6]              # disc number: 0 for most games, 1 for disc 2 of a 2-disc game
     wii = struct.unpack(">I", hdr[0x18:0x1C])[0] == WII_MAGIC
     gc = struct.unpack(">I", hdr[0x1C:0x20])[0] == GC_MAGIC
     title = hdr[0x20:0x60].split(b"\0", 1)[0].decode("ascii", "replace").strip()
-    return {"id": id6.decode("ascii"), "title": title, "wii": wii, "gc": gc, "nkit": nkit}
+    gid = id6.decode("ascii")
+    return {"id": gid, "key": gid if disc == 0 else f"{gid}#{disc + 1}", "disc": disc,
+            "title": title, "wii": wii, "gc": gc, "nkit": nkit}
+
+WII_SECTORS_PER_DISC = 143432 * 2   # 0x8000-byte sectors on a dual-layer Wii disc
+
+def wbfs_expected_size(path: Path):
+    """
+    Minimum byte size a .wbfs file must have according to its own block table
+    (highest used WBFS block + 1) * block size. None if the header is unreadable.
+    Used to spot files that were truncated by a crash or an interrupted copy.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+            if len(head) < 16 or head[:4] != b"WBFS" or not 9 <= head[8] <= 16 or not 16 <= head[9] <= 30:
+                return None
+            hd_sec_sz, wbfs_sec_sz = 1 << head[8], 1 << head[9]
+            n_blocks = WII_SECTORS_PER_DISC * 0x8000 // wbfs_sec_sz
+            f.seek(hd_sec_sz + 0x100)
+            table = f.read(n_blocks * 2)
+    except Exception:
+        return None
+    if len(table) < n_blocks * 2:
+        return None
+    max_used = max(struct.unpack(f">{n_blocks}H", table))
+    if max_used == 0:
+        return None
+    return (max_used + 1) * wbfs_sec_sz
+
+def wbfs_actual_size(path: Path) -> int:
+    """Size of a .wbfs plus its split parts (.wbf1, .wbf2, ...)."""
+    total = path.stat().st_size
+    for i in range(1, 20):
+        part = path.with_suffix(f".wbf{i}")
+        if not part.exists():
+            break
+        total += part.stat().st_size
+    return total
+
+def wbfs_is_complete(path: Path) -> bool:
+    """False when the file is clearly shorter than its block table says it must be."""
+    try:
+        if path.stat().st_size == 0:
+            return False
+        expected = wbfs_expected_size(path)
+        if expected is None:
+            return True      # cannot tell - assume fine
+        return wbfs_actual_size(path) >= expected
+    except OSError:
+        return False
 
 def is_nkit_image(path: Path, hdr=None) -> bool:
     """NKit images carry 'NKIT' at 0x200; the file name usually says so too."""
@@ -442,19 +541,29 @@ def is_nkit_image(path: Path, hdr=None) -> bool:
     return bool(hdr and hdr.get("nkit"))
 
 def index_existing_wbfs(out_dir: Path) -> dict:
-    """Map game ID -> path for every .wbfs already under out_dir (any naming scheme)."""
+    """Map game key (ID, plus disc number for multi-disc games) -> path for every
+    complete .wbfs already under out_dir, whatever it is called."""
     index = {}
     try:
         for p in out_dir.rglob("*"):
-            if not p.is_file() or p.suffix.lower() != ".wbfs":
+            try:
+                if not p.is_file() or p.suffix.lower() != ".wbfs":
+                    continue
+                if STAGING_NAME in p.parts:
+                    continue
+                hdr = read_disc_header(p)
+                if not hdr:
+                    continue
+                if not wbfs_is_complete(p):
+                    exp = wbfs_expected_size(p) or 0
+                    warn(f"Ignoring {p.name}: looks truncated "
+                         f"({wbfs_actual_size(p) / 1_048_576:,.0f} of {exp / 1_048_576:,.0f} MB), "
+                         "it will be converted again")
+                    index.setdefault("truncated:" + hdr["key"], p)
+                    continue
+                index.setdefault(hdr["key"], p)
+            except OSError:
                 continue
-            if STAGING_NAME in p.parts:
-                continue
-            if p.stat().st_size == 0:
-                continue
-            hdr = read_disc_header(p)
-            if hdr:
-                index.setdefault(hdr["id"], p)
     except OSError as exc:
         warn(f"Could not fully scan {out_dir}: {exc}")
     return index
@@ -476,7 +585,7 @@ def wbfs_name_for(source: Path, hdr, name_format: str) -> str:
         return stem
     try:
         name = name_format.format(name=stem, id=hdr["id"], title=hdr["title"] or stem)
-    except (KeyError, IndexError, ValueError):
+    except Exception:
         warn(f"Invalid name_format '{name_format}', using '{{name}} [{{id}}]'")
         name = f"{stem} [{hdr['id']}]"
     return safe_filename(name)
@@ -518,12 +627,48 @@ def clean_staging(out_dir: Path):
             warn(f"  could not delete {p}: {exc}")
 
 # ── Utilities ────────────────────────────────────────────────────────────────
+def _quote_arg(a) -> str:
+    """Quote one argument for the Windows command line (MS C runtime rules), always."""
+    a = str(a)
+    out, bs = [], 0
+    for ch in a:
+        if ch == "\\":
+            bs += 1
+            continue
+        if ch == '"':
+            out.append("\\" * (bs * 2 + 1) + '"')
+            bs = 0
+            continue
+        if bs:
+            out.append("\\" * bs)
+            bs = 0
+        out.append(ch)
+    if bs:
+        out.append("\\" * (bs * 2))
+    return '"' + "".join(out) + '"'
+
+def _cmd_for_subprocess(cmd: list):
+    """On Windows pass a fully quoted command line: cygwin programs (wit) parse it
+    themselves and would otherwise trip over an unquoted apostrophe or glob character."""
+    if IS_WINDOWS:
+        return " ".join(_quote_arg(c) for c in cmd)
+    return [str(c) for c in cmd]
+
+def _crash_hint(cmd: list, code: int):
+    if code < 0 or code > 0xFFFF:
+        exe = Path(str(cmd[0]))
+        error(f"{exe.name} crashed or could not load (code 0x{code & 0xFFFFFFFF:08X}). "
+              "Usually a missing DLL or an antivirus block.")
+        for t in TOOLS_DIRS:
+            if t in exe.parents:
+                error(f"Delete the folder {exe.parent} and run again to re-download it.")
+
 def run_cmd(cmd: list, desc: str) -> bool:
     info(f"Command: {' '.join(str(c) for c in cmd)}")
     print()
     t0 = time.time()
     try:
-        result = subprocess.run(cmd)
+        result = subprocess.run(_cmd_for_subprocess(cmd))
     except OSError as exc:
         error(f"{desc} could not start: {exc}")
         return False
@@ -531,6 +676,7 @@ def run_cmd(cmd: list, desc: str) -> bool:
     _enable_ansi()   # cygwin programs (wit) reset the console mode when they exit
     if result.returncode != 0:
         error(f"{desc} failed (exit code {result.returncode})")
+        _crash_hint(cmd, result.returncode)
         return False
     ok(f"{desc} completed in {elapsed:.1f}s")
     return True
@@ -542,7 +688,7 @@ def run_cmd_code(cmd: list, desc: str) -> int:
     print()
     t0 = time.time()
     try:
-        result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+        result = subprocess.run(_cmd_for_subprocess(cmd), stdin=subprocess.DEVNULL)
     except OSError as exc:
         error(f"{desc} could not start: {exc}")
         return -1
@@ -552,6 +698,7 @@ def run_cmd_code(cmd: list, desc: str) -> int:
         ok(f"{desc} completed in {elapsed:.1f}s")
     else:
         warn(f"{desc} exited with code {result.returncode} after {elapsed:.1f}s")
+        _crash_hint(cmd, result.returncode)
     return result.returncode
 
 def print_sizes(src: Path, dst: Path, show_ratio=False):
@@ -738,25 +885,34 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
     else:
         warn("Could not read a disc header - is this really a Wii ISO?")
 
+    key = hdr["key"] if hdr else None
+    same_game = existing_index.get(key) if (existing_index and key) else None
     if skip_existing:
-        if dest.exists() and dest.stat().st_size > 0:
-            warn(f"Already exists, skipping: {dest.name}")
-            return None
-        if hdr and existing_index and hdr["id"] in existing_index:
-            warn(f"Already converted as {existing_index[hdr['id']].name} "
+        if dest.exists():
+            if wbfs_is_complete(dest):
+                warn(f"Already exists, skipping: {dest.name}")
+                return None
+            warn(f"{dest.name} exists but looks truncated - converting it again")
+        elif same_game is not None:
+            warn(f"Already converted as {same_game.name} "
                  f"(same game ID {hdr['id']}), skipping")
             return None
 
-    needed = source.stat().st_size + 64 * 1_048_576
-    if not enough_space(out_dir, needed):
-        free = shutil.disk_usage(out_dir).free / 1_073_741_824
-        error(f"Not enough free space on {out_dir.anchor or out_dir} "
-              f"({free:.1f} GB free, {needed / 1_073_741_824:.1f} GB needed)")
+    # A WBFS is at most as large as its ISO, usually much smaller (unused blocks are dropped).
+    free = shutil.disk_usage(out_dir).free
+    if free < 512 * 1_048_576:
+        error(f"Not enough free space on {out_dir.anchor or out_dir} ({free / 1_048_576:,.0f} MB free)")
         return False
+    if free < source.stat().st_size:
+        warn(f"Only {free / 1_073_741_824:.1f} GB free on {out_dir.anchor or out_dir}; "
+             "the conversion will fail if the WBFS does not fit")
 
     stage_dir = out_dir / STAGING_NAME
     stage_dir.mkdir(parents=True, exist_ok=True)
-    staged = stage_dir / dest.name
+    # Work under a plain name: wit treats '%' in a destination name as an escape sequence
+    # and cygwin has its own quoting rules. The finished file is renamed to dest afterwards.
+    plain = re.sub(r"[^A-Za-z0-9._ \[\]()-]", "_", dest.stem)[:120] or "game"
+    staged = stage_dir / (plain + ".wbfs")
     split_args = ["--split"] if split else []   # wit picks a FAT-safe part size itself
 
     if nkit_img:
@@ -830,11 +986,29 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
             p.unlink(missing_ok=True)
         return False
 
+    # Remove stale copies of this game before moving the new one into place
     for p in parts:
-        final = out_dir / p.name
-        if final.exists():
-            final.unlink()
-        shutil.move(str(p), str(final))
+        old = out_dir / (dest.stem + p.suffix)
+        if old.exists():
+            old.unlink()
+    stale = [(same_game, "Replaced the older copy")]
+    if existing_index and key:
+        stale.append((existing_index.pop("truncated:" + key, None), "Removed the truncated copy"))
+    for old, msg in stale:
+        if old is None or not old.exists() or old.resolve() == dest.resolve():
+            continue
+        try:
+            for i in range(1, 20):
+                part = old.with_suffix(f".wbf{i}")
+                if part.exists():
+                    part.unlink()
+            old.unlink()
+            warn(f"{msg} {old.name}")
+        except OSError as exc:
+            warn(f"Could not remove {old}: {exc}")
+
+    for p in parts:
+        shutil.move(str(p), str(out_dir / (dest.stem + p.suffix)))
 
     step("*", "Result")
     ok(f"Created file: {dest}")
@@ -843,8 +1017,8 @@ def convert_iso_to_wbfs(source: Path, cfg, wit: Path, out_dir: Path = None,
     ok(f"Original ISO preserved: {source}")
     if dest.exists():
         print_sizes(source, dest)
-    if existing_index is not None and hdr:
-        existing_index.setdefault(hdr["id"], dest)
+    if existing_index is not None and key:
+        existing_index[key] = dest
     return True
 
 def optional_tool(cfg, key, label, allow_download):
@@ -861,17 +1035,21 @@ def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
     """Convert every .iso under in_dir to .wbfs in out_dir. Returns True if nothing failed."""
     name_format = cfg.get("batch", "name_format", fallback="{name} [{id}]").strip() or "{name}"
     nkit_mode = cfg.get("batch", "nkit_mode", fallback="wbfs").strip().lower() or "wbfs"
+    if "{id}" not in name_format:
+        warn(f"name_format '{name_format}' has no {{id}}: two different games with the same "
+             "name would overwrite each other")
     out_res = out_dir.resolve()
+    clean_staging(out_dir)
 
     isos = []
     for p in sorted(in_dir.rglob("*")):
-        if not p.is_file() or p.suffix.lower() != ".iso":
-            continue
         try:
-            if out_res == p.parent.resolve() or out_res in p.parent.resolve().parents:
-                continue  # never treat the output folder as input
+            if not p.is_file() or p.suffix.lower() != ".iso":
+                continue
+            if STAGING_NAME in p.parts or p.parent.resolve() == out_res:
+                continue  # never treat this tool's own output as input
         except OSError:
-            pass
+            continue
         isos.append(p)
 
     if not isos:
@@ -879,13 +1057,12 @@ def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
         warn("Put your Wii ISO files in that folder and run this again.")
         return True
 
-    clean_staging(out_dir)
     fs = filesystem_name(out_dir)
     split = fs is not None and fs.upper().startswith("FAT")   # FAT / FAT32: 4 GB file limit
     if fs:
         info(f"Output filesystem: {fs}" + ("  -> large games will be split at 4 GB" if split else ""))
 
-    existing = {} if overwrite else index_existing_wbfs(out_dir)
+    existing = index_existing_wbfs(out_dir)   # with --overwrite: used to replace older copies
     if existing:
         info(f"{len(existing)} game(s) already present in {out_dir}")
 
@@ -904,8 +1081,14 @@ def batch_iso_to_wbfs(in_dir: Path, out_dir: Path, cfg, wit: Path,
     t0 = time.time()
 
     for i, iso in enumerate(isos, 1):
-        print(f"\n{BOLD}{CYAN}=== [{i}/{len(isos)}] {iso.name} "
-              f"({iso.stat().st_size / 1_048_576:,.1f} MB) ==={RESET}")
+        try:
+            size_mb = iso.stat().st_size / 1_048_576
+        except OSError:
+            print(f"\n{BOLD}{CYAN}=== [{i}/{len(isos)}] {iso.name} ==={RESET}")
+            error("File disappeared while the batch was running - skipped")
+            failed.append(iso.name)
+            continue
+        print(f"\n{BOLD}{CYAN}=== [{i}/{len(isos)}] {iso.name} ({size_mb:,.1f} MB) ==={RESET}")
         try:
             res = convert_iso_to_wbfs(iso, cfg, wit, out_dir=out_dir,
                                       skip_existing=not overwrite,
@@ -1029,7 +1212,7 @@ def main():
             fail("Batch mode currently supports ISO -> WBFS only (--to wbfs).")
 
         cfg = load_config()
-        in_raw = args.batch or cfg.get("batch", "input_iso", fallback="").strip()
+        in_raw = cfg_path(args.batch or cfg.get("batch", "input_iso", fallback=""))
         if not in_raw:
             fail("No input folder. Use --batch <folder> or set [batch] input_iso in config.ini.")
         in_dir = Path(in_raw).resolve()
@@ -1047,7 +1230,7 @@ def main():
         ok(f"Input dir  : {in_dir}")
         ok(f"Base       : {BASE_DIR}")
 
-        out_override = args.output or cfg.get("batch", "output_wbfs", fallback="").strip() or None
+        out_override = cfg_path(args.output or cfg.get("batch", "output_wbfs", fallback="")) or None
         try:
             out_dir = get_output_dir(cfg, "wbfs", override=out_override)
         except OSError as exc:
@@ -1111,8 +1294,14 @@ def main():
     dolphin = require_tool(cfg, "dolphin_tool", "DolphinTool", False) if needs_dolphin else None
     wit = require_tool(cfg, "wit_tool", "WIT", allow_download) if needs_wit else None
 
-    out_dir = get_output_dir(cfg, fmt_dest, override=args.output)
+    try:
+        out_dir = get_output_dir(cfg, fmt_dest, override=args.output)
+    except OSError as exc:
+        fail(f"Output folder could not be created ({exc}). Check output_{fmt_dest} in config.ini "
+             "or pass --output.")
     ok(f"Output dir : {out_dir}")
+    if fmt_dest == "wbfs":
+        clean_staging(out_dir)
 
     # ── Conversion ──────────────────────────────────────────────────────────
     if ext == ".wbfs":

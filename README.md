@@ -2,23 +2,25 @@
 
 A simple Windows tool to convert Wii disc image files between **RVZ**, **WBFS**, and **ISO** formats using **DolphinTool** and **WIT**.
 
-It supports **drag & drop**, a **one-click batch mode** (`iso_to_wbfs.bat`), and works with both the Python script and the precompiled Windows release.
+It supports **drag & drop** and a **one-click batch mode** (`iso_to_wbfs.bat`). The batch mode needs the script version; the v1.0.0 precompiled release only offers drag & drop.
 
 ---
 
 ## Quick start: `D:\Wii\ISO` → `D:\Wii\wbfs` in one click
 
-1. Put your `.iso` files in `D:\Wii\ISO`.
+1. Extract the whole ZIP (do not run it from inside the ZIP window) and put your `.iso` files in `D:\Wii\ISO`.
 2. Double-click **`iso_to_wbfs.bat`**.
+
+The folders come from `config.ini`, section `[batch]` (`input_iso` / `output_wbfs`), and default to `D:\Wii\ISO` → `D:\Wii\wbfs`.
 
 That is all. The launcher takes care of the rest on a fresh Windows PC:
 
-- **Python missing?** It is installed automatically with `winget` (Windows Package Manager). If that is not possible the Python download page opens with instructions.
+- **Python missing or too old?** Python 3.12 is installed automatically with `winget` (Windows Package Manager) when no Python 3.8+ is found. If that is not possible the Python download page opens with instructions.
 - **`wit.exe` missing?** The official Wiimms ISO Tools build is downloaded into `tools\wit\`, checksum-verified, and used from there.
 - **NKit images (`*.nkit.iso`)?** These are not real ISOs and WIT rejects them ("No valid source file found"). The converter detects them and restores them with NKit, which is downloaded into `tools\nkit\` the same way.
 - **No `config.ini`?** One is created with these folders already filled in.
-- **Ran it before / converted some games with another tool?** Games already in `D:\Wii\wbfs` are skipped, even if they were named differently, because the game ID inside the file is compared. Unfinished files from an interrupted run are cleaned up and redone.
-- Output is named `Game Name [GAMEID].wbfs`, the naming Wii USB loaders recognise. On a FAT32 drive, games over 4 GB are split automatically.
+- **Ran it before / converted some games with another tool?** Games already in `D:\Wii\wbfs` (any sub-folder, any file name) are skipped, because the game ID inside the file is compared. A `.wbfs` that is shorter than its own block table says (a crash or an interrupted copy) is treated as missing and converted again, and files left in `.incomplete\` by an interrupted run are deleted.
+- Output is named `<ISO file name> [GAMEID].wbfs` (`.nkit` is dropped from the name), the naming Wii USB loaders recognise. On a FAT32 drive, games over 4 GB are split into `.wbfs` + `.wbf1`... parts automatically.
 - Original ISOs are never modified or deleted. A summary of converted / skipped / failed games is printed at the end.
 
 ---
@@ -109,7 +111,9 @@ Only needed for **RVZ** conversions. **DolphinTool.exe** is included with **Dolp
 
 You normally do not have to install it: when it cannot be found, the converter downloads the official
 `wit-v3.05a-r8638-cygwin64.zip` from <https://wit.wiimm.de/>, verifies its SHA-256 checksum, and unpacks
-`wit.exe` (with the DLLs it needs) into `tools\wit\` next to the script. Pass `--no-download` to disable this.
+`wit.exe` (with the DLLs it needs) into `tools\wit\` next to the script (or into
+`%LOCALAPPDATA%\WiiFormatConverter\tools\wit\` when the script folder is not writable, e.g. under Program Files).
+Pass `--no-download` to disable this.
 
 To install it manually instead:
 
@@ -182,15 +186,17 @@ nkit_mode = wbfs
 | `wit_tool` | Full path to `wit.exe`; empty = auto-detect, then auto-download | *(empty)* |
 | `nkit_tool` | Full path to `nkit.exe` (NKit 2, only for `*.nkit.iso`); empty = auto-detect, then auto-download | *(empty)* |
 | `output_rvz` | Output folder for RVZ files | `.\RVZ` |
-| `output_wbfs` | Output folder for WBFS files | `D:\Wii\wbfs` |
+| `output_wbfs` | Output folder for WBFS files in drag & drop mode (batch mode uses `[batch] output_wbfs`) | `D:\Wii\wbfs` |
 | `rvz_compression` | RVZ compression codec: `none`, `zstd`, `bzip2`, `lzma`, `lzma2` | `zstd` |
 | `rvz_compression_level` | Compression level (`1-22` for `zstd`, `1-9` for others) | `5` |
-| `[batch] input_iso` | Folder scanned for `.iso` files in batch mode | `D:\Wii\ISO` |
-| `[batch] output_wbfs` | Folder where batch mode writes `.wbfs` files | `D:\Wii\wbfs` |
+| `[batch] input_iso` | Folder scanned (with sub-folders) for `.iso` files by `iso_to_wbfs.bat` / `--batch` | `D:\Wii\ISO` |
+| `[batch] output_wbfs` | Folder where batch mode writes `.wbfs` files; takes precedence over `[output] output_wbfs` | `D:\Wii\wbfs` |
 | `[batch] name_format` | Output name for ISO → WBFS. `{name}` = ISO file name (a trailing `.nkit` is dropped), `{id}` = game ID, `{title}` = disc title. Kept as-is if the ISO name already contains the game ID | `{name} [{id}]` |
 | `[batch] nkit_mode` | How NKit images are converted: `wbfs` (NKit writes WBFS directly) or `iso` (NKit restores a full ISO, then wit) | `wbfs` |
 
-Tools are searched in this order: the configured path, next to the script, `tools\wit\` / `tools\dolphin\`,
+Paths may be written with or without quotes and with or without a trailing backslash. A `%` in a value is taken literally.
+
+Tools are searched in this order: the configured path, next to the script, `tools\wit\` / `tools\nkit\` / `tools\dolphin\` (next to the script or under `%LOCALAPPDATA%\WiiFormatConverter\`),
 the system `PATH`, and the usual install folders (`C:\WiimmsISOTools\`, `C:\Program Files\Wiimm\WIT\`,
 `C:\Dolphin\`, `C:\Program Files\Dolphin\`). If `wit.exe` is still not found it is downloaded.
 
@@ -214,13 +220,14 @@ output_wbfs = .\WBFS
 
 ### Batch: convert every ISO in `D:\Wii\ISO` to WBFS in `D:\Wii\wbfs`
 
-Double-click **`iso_to_wbfs.bat`** (see *Quick start* above). Every `.iso` in `D:\Wii\ISO`, including
-sub-folders, is written as `Name [GAMEID].wbfs` into `D:\Wii\wbfs`.
+Double-click **`iso_to_wbfs.bat`** (see *Quick start* above). Every `.iso` in `[batch] input_iso`, including
+sub-folders, is written as `<ISO file name> [GAMEID].wbfs` into `[batch] output_wbfs`. To use other folders,
+edit those two lines in `config.ini`.
 
 What happens on each run:
 
 ```text
-1. Find a working Python (or install it with winget)
+1. Find a working Python 3.8+ (or install Python 3.12 with winget)
 2. Find wit.exe (or download it into tools\wit\); if NKit images are present, also nkit.exe (tools\nkit\)
 3. Delete unfinished files left in D:\Wii\wbfs\.incomplete\ by an interrupted run
 4. Read the game ID of every .wbfs already in D:\Wii\wbfs (any name, any sub-folder)
@@ -239,17 +246,17 @@ Useful flags:
 
 | Flag | Effect |
 |---|---|
-| `--batch [FOLDER]` | Batch mode. Without a folder, uses `[batch] input_iso` from `config.ini` |
+| `--batch [FOLDER]` | Batch mode. Without a folder, uses `[batch] input_iso` from `config.ini` (what `iso_to_wbfs.bat` does) |
 | `--to rvz\|wbfs` | Target format for ISO input; skips the Yes/No dialog |
 | `--output FOLDER` | Output folder, overrides `config.ini` |
-| `--overwrite` | Re-convert games that already exist in the output folder |
+| `--overwrite` | Re-convert games that already exist in the output folder; an older copy of the same game under another name is replaced |
 | `--no-download` | Never download `wit.exe` / `nkit.exe` automatically |
 | `--no-pause` | Do not wait for ENTER at the end (for scripts/schedulers) |
 
 ### Method 1 — Drag & drop with `convert.bat`
 
 1. Optionally edit `config.ini` (it is created automatically on first run).
-2. Drag a `.rvz`, `.wbfs`, or `.iso` file onto `convert.bat`.
+2. Drag one or more `.rvz`, `.wbfs`, or `.iso` files onto `convert.bat` (files are converted one after another).
 3. A console window opens and shows the conversion progress.
 4. The converted file is saved in the output folder defined in the configuration.
 
@@ -335,11 +342,13 @@ Step *  Remove temporary files/folders when needed
 | `Automatic download of nkit.exe failed` | No internet, or github.com unreachable | Download `NKit_CLI_win-x64_2.1.0.zip` from <https://github.com/Nanook/NKit/releases> and unzip it into `tools\nkit\` |
 | Colours show as `←[92m` | Old console without VT support | Cosmetic only; use Windows Terminal or ignore |
 | `Python could not be installed automatically` | `winget` missing or blocked | Install Python from python.org with "Add python.exe to PATH" ticked, then run the `.bat` again |
-| `Not enough free space` | Output drive is nearly full | Free up space; a WBFS is at most as large as its ISO |
-| `Already converted as ... (same game ID)` | That game already exists in the output folder under another name | Nothing to do; use `--overwrite` to redo it |
+| `Not enough free space` | Less than 512 MB free on the output drive | Free up space; a WBFS is at most as large as its ISO, usually much smaller |
+| `Already converted as ... (same game ID)` | That game already exists in the output folder under another name | Nothing to do; `--overwrite` converts it again and replaces the older copy |
+| `Ignoring ... looks truncated` | A `.wbfs` in the output folder is shorter than its block table requires (interrupted copy or crash) | Nothing to do; the game is converted again and the file replaced |
+| `The converter ended with exit code N` | Something above it failed | Read the `[ERR]` lines above; exit code 2 usually means a wrong command line or `convert.py` not found |
 | `Unsupported format` | File is not `.rvz`, `.wbfs`, or `.iso` | Use a supported format |
 | `... failed (exit code 1)` | DolphinTool or WIT returned an error | Check that the source file is valid and not corrupted |
-| Window closes immediately | Python not found in PATH | Reinstall Python and enable **Add Python to PATH** |
+| Window closes / flashes | Very rare: the launcher itself could not run | Extract the whole ZIP first; if it persists, open a Command Prompt in the folder and run `iso_to_wbfs.bat` there to read the message |
 
 ---
 
